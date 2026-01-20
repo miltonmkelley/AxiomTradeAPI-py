@@ -1,9 +1,6 @@
-"""
-Authentication and Cookie Manager for Axiom Trade API
-Handles automatic login, token refresh, and cookie management
-"""
-
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 import time
 import logging
@@ -15,6 +12,111 @@ from cryptography.fernet import Fernet
 from typing import Dict, Optional, Union
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+
+@dataclass
+class AuthTokens:
+    """Container for authentication tokens"""
+    access_token: str
+    refresh_token: str
+    expires_at: float
+    issued_at: float
+    
+    @property
+    def is_expired(self) -> bool:
+        """Check if token is expired (with 5 minute buffer)"""
+        return time.time() >= (self.expires_at - 300)  # 5 minute buffer
+    
+    @property
+    def needs_refresh(self) -> bool:
+        """Check if token needs refresh (15 minute buffer)"""
+        return time.time() >= (self.expires_at - 900)  # 15 minute buffer
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization"""
+        return {
+            'access_token': self.access_token,
+            'refresh_token': self.refresh_token,
+            'expires_at': self.expires_at,
+            'issued_at': self.issued_at
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'AuthTokens':
+        """Create from dictionary"""
+        return cls(
+            access_token=data['access_token'],
+            refresh_token=data['refresh_token'],
+            expires_at=data['expires_at'],
+            issued_at=data['issued_at']
+        )
+
+
+class SecureTokenStorage:
+    """Handles secure storage and retrieval of authentication tokens"""
+    
+    def __init__(self, storage_dir: str = None):
+        """
+        Initialize secure token storage
+        
+        Args:
+            storage_dir: Directory to store tokens (default: ~/.axiomtradeapi)
+        """
+        self.storage_dir = Path(storage_dir or Path.home() / '.axiomtradeapi')
+        self.storage_dir.mkdir(exist_ok=True, mode=0o700)  # Only user can access
+        
+        self.token_file = self.storage_dir / 'tokens.enc'
+        self.key_file = self.storage_dir / 'key.enc'
+        
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize encryption key
+        self._init_encryption_key()
+    
+    def _init_encryption_key(self):
+        """Initialize or load encryption key"""
+        if self.key_file.exists():
+            with open(self.key_file, 'rb') as f:
+                self.key = f.read()
+        else:
+            self.key = Fernet.generate_key()
+            with open(self.key_file, 'wb') as f:
+                f.write(self.key)
+            # Set file permissions to be readable only by user
+            os.chmod(self.key_file, 0o600)
+        
+        self.cipher_suite = Fernet(self.key)
+    
+    def save_tokens(self, tokens: AuthTokens) -> bool:
+        """
+        Securely save authentication tokens
+        
+        Args:
+            tokens: AuthTokens to save
+            
+        Returns:
+            bool: True if saved successfully, False otherwise
+        """
+        try:
+            # Convert tokens to JSON
+            token_data = json.dumps(tokens.to_dict()).encode('utf-8')
+            
+            # Encrypt the data
+            encrypted_data = self.cipher_suite.encrypt(token_data)
+            
+            # Write to file
+            with open(self.token_file, 'wb') as f:
+                f.write(encrypted_data)
+            
+            # Set file permissions to be readable only by user
+            os.chmod(self.token_file, 0o600)
+            
+            self.logger.debug("Tokens saved securely")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save tokens: {e}")
+            return False
 
 
 @dataclass
@@ -260,6 +362,33 @@ class AuthManager:
         # Initialize with provided tokens if given (overrides saved tokens)
         if auth_token and refresh_token:
             self._set_tokens(auth_token, refresh_token)
+
+        # Initialize Session with Connection Pooling and Retries
+        self._init_session()
+
+    def _init_session(self):
+        """Initialize requests session with pooling and retries"""
+        self.session = requests.Session()
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=5,  # Increased for stability
+            backoff_factor=1.0, # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        
+        # Create adapter with increased pool size
+        # Pool size should be enough for expected concurrency
+        adapter = HTTPAdapter(
+            pool_connections=50,
+            pool_maxsize=50,
+            max_retries=retry_strategy
+        )
+        
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.logger.debug("Session initialized with connection pooling (size=50) and retries")
     
     def _set_tokens(self, auth_token: str, refresh_token: str, 
                    expires_in: int = 3600, save_tokens: bool = True) -> None:
@@ -684,9 +813,9 @@ class AuthManager:
         headers = kwargs.pop('headers', {})
         authenticated_headers = self.get_authenticated_headers(headers)
         
-        # Make the request
+        # Make the request using the session
         self.logger.debug(f"Making authenticated {method} request to {url}")
-        response = requests.request(method, url, headers=authenticated_headers, **kwargs)
+        response = self.session.request(method, url, headers=authenticated_headers, **kwargs)
         
         return response
 

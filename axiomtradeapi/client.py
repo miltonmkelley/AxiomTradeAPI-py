@@ -433,6 +433,201 @@ class AxiomTradeClient:
             return response.json()
         except Exception as e:
             raise Exception(f"Failed to get token analysis: {e}")
+
+    def get_pair_chart(self, pair_address: str, from_ts: int, to_ts: int, 
+                       interval: str = "1s", count_bars: int = 300, 
+                       pair_created_at: Optional[int] = None,
+                       open_trading: Optional[int] = None,
+                       last_transaction_time: Optional[int] = None,
+                       currency: str = "SOL") -> List[Dict]:
+        """
+        Get pair chart candles (OHLCV).
+        
+        Args:
+            pair_address (str): The pair address.
+            from_ts (int): Start timestamp in milliseconds.
+            to_ts (int): End timestamp in milliseconds.
+            interval (str): Candle interval, default "1s".
+            count_bars (int): Number of bars to return, default 300.
+            pair_created_at (Optional[int]): Creation timestamp (optimization).
+            open_trading (Optional[int]): Open trading timestamp (optimization).
+            last_transaction_time (Optional[int]): Last transaction timestamp (optimization).
+            currency (str): Currency for prices, "SOL" or "USD". Default "SOL".
+            
+        Returns:
+            List[Dict]: List of candle data.
+        """
+        # Ensure we have valid authentication
+        if not self.ensure_authenticated():
+            raise ValueError("Authentication failed. Please login first.")
+
+        # Construct query parameters
+        params = {
+            "pairAddress": pair_address,
+            "from": from_ts,
+            "to": to_ts,
+            "currency": currency,
+            "interval": interval,
+            "countBars": count_bars,
+            "showOutliers": "false",
+            "isNew": "false",
+            "v": "2"
+        }
+        
+        if pair_created_at:
+            params["pairCreatedAt"] = pair_created_at
+        if open_trading:
+            params["openTrading"] = open_trading
+        if last_transaction_time:
+            params["lastTransactionTime"] = last_transaction_time
+            
+        # Manually constructing the URL to ensure correct parameter encoding if needed, 
+        # or just pass params to requests. 
+        # API9 matches the user's example.
+        url = "https://api9.axiom.trade/pair-chart"
+        
+        try:
+            response = self.auth_manager.make_authenticated_request('GET', url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                # Try to find the list in common keys
+                for key in ["data", "candles", "bars", "result", "items"]:
+                    if key in data and isinstance(data[key], list):
+                        return data[key]
+                
+                # If no list found, maybe the dict IS the candle (unlikely) or it's an error/empty
+                self.logger.warning(f"get_pair_chart returned a dict with keys: {list(data.keys())}, expected a list.")
+                return []
+            else:
+                self.logger.warning(f"get_pair_chart returned unexpected type: {type(data)}")
+                return []
+                
+        except Exception as e:
+            raise Exception(f"Failed to get pair chart: {e}")
+
+    def analyze_pair_ath_intervals(self, pair_address: str, currency: str = "SOL") -> Dict[str, Dict[str, float]]:
+        """
+        Analyze ATH after 1, 2, 5, 10 minutes from creation (or open trading).
+        
+        Args:
+            pair_address (str): The pair address.
+            currency (str): Currency to use ("SOL" or "USD"). Default: "SOL".
+            
+        Returns:
+            Dict[str, Dict[str, float]]: Map of intervals to price/mcap data.
+        """
+        # 1. Get pair info to find creation time and open trading time
+        try:
+            pair_info = self.get_pair_info(pair_address)
+            
+            # Helper to parse timestamps
+            def parse_ts(val):
+                if not val: return None
+                if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
+                    return int(val)
+                try:
+                    import datetime
+                    val_str = str(val).replace('Z', '+00:00')
+                    dt = datetime.datetime.fromisoformat(val_str)
+                    return int(dt.timestamp() * 1000)
+                except:
+                    return None
+
+            created_at = pair_info.get("createdAt") or pair_info.get("pairCreatedAt")
+            if not created_at and "pair" in pair_info: 
+                 created_at = pair_info["pair"].get("createdAt")
+            
+            open_trading = pair_info.get("openTrading") or pair_info.get("pair", {}).get("openTrading")
+            supply = float(pair_info.get("supply", 0))
+            
+            created_at_ms = parse_ts(created_at)
+            open_trading_ms = parse_ts(open_trading)
+            
+            # Determine start time: prefer open_trading, fallback to created_at
+            if open_trading_ms:
+                start_ts = open_trading_ms
+            elif created_at_ms:
+                start_ts = created_at_ms
+            else:
+                raise ValueError("Could not determine start time (no creation or openTrading time)")
+                
+        except Exception as e:
+             raise Exception(f"Error fetching pair info for analysis: {e}")
+
+        # Define intervals in milliseconds (for reference, logic uses raw minutes)
+        intervals_map = {
+            "1min": 1,
+            "3min": 3, 
+            "5min": 5,
+            "10min": 10,
+            "30min": 30,
+            "60min": 60,
+            "240min": 240
+        }
+        # Updated to match DB schema: 1, 3, 5, 10, 30, 60, 240
+        output_intervals = [1, 3, 5, 10, 30, 60, 240]
+        
+        # 2. Get last transaction time (Required by API)
+        last_transaction_time = None
+        try:
+            last_tx = self.get_last_transaction(pair_address)
+            if last_tx and "createdAt" in last_tx:
+                import datetime
+                lt_str = last_tx["createdAt"].replace('Z', '+00:00')
+                dt = datetime.datetime.fromisoformat(lt_str)
+                last_transaction_time = int(dt.timestamp() * 1000)
+        except Exception as e:
+            self.logger.warning(f"Error fetching last transaction: {e}")
+
+        needed_duration_minutes = 245 # Small buffer over 240
+        end_ts = start_ts + (needed_duration_minutes * 60 * 1000)
+        
+        try:
+            candles = self.get_pair_chart(
+                pair_address=pair_address,
+                from_ts=start_ts,
+                to_ts=end_ts,
+                interval="1m",
+                count_bars=300, 
+                pair_created_at=created_at_ms,
+                open_trading=open_trading_ms,
+                last_transaction_time=last_transaction_time,
+                currency=currency
+            )
+        except Exception as e:
+            self.logger.error(f"Error fetching candles for {pair_address}: {e}")
+            candles = []
+
+        # 3. Calculate ATH for each interval
+        results = {}
+        
+        if not candles:
+             return {f"{k}min": {"price": 0.0, "mcap": 0.0} for k in output_intervals}
+        
+        # Sort candles by time
+        candles.sort(key=lambda x: x.get("time", 0))
+        
+        # Helper to get max high from first N candles
+        def get_max_high(n_candles):
+            if not candles:
+                return 0.0
+            subset = candles[:n_candles]
+            if not subset:
+                return 0.0
+            return max(float(c.get("high", 0)) for c in subset)
+
+        for mins in output_intervals:
+            ath_price = get_max_high(mins)
+            results[f"{mins}min"] = {
+                "price": ath_price,
+                "mcap": ath_price * supply
+            }
+                
+        return results
     
     def send_transaction_to_rpc(self, signed_transaction_base64: str, 
                                rpc_url: str = "https://greer-651y13-fast-mainnet.helius-rpc.com/") -> Dict[str, Union[str, bool]]:
