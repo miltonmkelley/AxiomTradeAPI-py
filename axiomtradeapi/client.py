@@ -6,6 +6,7 @@ import logging
 from typing import Dict, Optional, List, Union, TYPE_CHECKING
 from .auth.auth_manager import AuthManager, create_authenticated_session
 from .content.endpoints import Endpoints
+from .websocket._client import AxiomTradeWebSocketClient
 
 # Trading-related imports
 if TYPE_CHECKING:
@@ -61,6 +62,9 @@ class AxiomTradeClient:
         
         # Initialize endpoints for trading functionality
         self.endpoints = Endpoints()
+        
+        # Initialize WebSocket client
+        self.ws = AxiomTradeWebSocketClient(self.auth_manager)
         
         # Keep backward compatibility
         self.auth = self.auth_manager  # For legacy code
@@ -339,6 +343,15 @@ class AxiomTradeClient:
             return response.json()
         except Exception as e:
             raise Exception(f"Failed to get pair stats: {e}")
+
+    async def subscribe_new_tokens(self, callback):
+        """
+        Subscribe to new token updates via WebSocket
+        
+        Args:
+            callback: Function to call when new token data is received
+        """
+        await self.ws.subscribe_new_tokens(callback)
     
     def get_meme_open_positions(self, wallet_address: str) -> Dict:
         """
@@ -433,6 +446,56 @@ class AxiomTradeClient:
             return response.json()
         except Exception as e:
             raise Exception(f"Failed to get token analysis: {e}")
+
+    def get_twitter_community_info(self, community_id: str) -> Dict:
+        """
+        Get Twitter community information
+        
+        Args:
+            community_id (str): The Twitter community ID to get info for
+            
+        Returns:
+            Dict: Community information including name, creator, members, etc.
+        """
+        # Ensure we have valid authentication
+        if not self.ensure_authenticated():
+            raise ValueError("Authentication failed. Please login first.")
+        
+        url = f'https://api.axiom.trade/twitter-community-info?communityId={community_id}'
+        
+        try:
+            response = self.auth_manager.make_authenticated_request('GET', url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise Exception(f"Failed to get community info: {e}")
+    
+    def get_transactions_feed(self, pair_address: str, order_by: str = 'ASC', 
+                              maker_address: str = '') -> List[Dict]:
+        """
+        Get transactions feed for a pair
+        
+        Args:
+            pair_address (str): The pair address to get transactions for
+            order_by (str): Order direction - 'ASC' or 'DESC' (default: 'ASC')
+            maker_address (str): Optional maker address filter (default: '')
+            
+        Returns:
+            List[Dict]: List of transactions
+        """
+        # Ensure we have valid authentication
+        if not self.ensure_authenticated():
+            raise ValueError("Authentication failed. Please login first.")
+        
+        url = f'https://api10.axiom.trade/transactions-feed?pairAddress={pair_address}&orderBy={order_by}&makerAddress={maker_address}'
+        
+        try:
+            response = self.auth_manager.make_authenticated_request('GET', url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            raise Exception(f"Failed to get transactions feed: {e}")
+
 
     def get_pair_chart(self, pair_address: str, from_ts: int, to_ts: int, 
                        interval: str = "1s", count_bars: int = 300, 
@@ -626,6 +689,132 @@ class AxiomTradeClient:
                 "price": ath_price,
                 "mcap": ath_price * supply
             }
+                
+        return results
+
+    def analyze_pair_ath_1s(self, pair_address: str, currency: str = "SOL") -> Dict[str, Dict[str, float]]:
+        """
+        Analyze ATH after 1 second from creation (or open trading).
+        
+        Args:
+            pair_address (str): The pair address.
+            currency (str): Currency to use ("SOL" or "USD"). Default: "SOL".
+            
+        Returns:
+            Dict[str, Dict[str, float]]: Map of intervals to price/mcap data.
+        """
+        # 1. Get pair info to find creation time and open trading time
+        try:
+            pair_info = self.get_pair_info(pair_address)
+            
+            # Helper to parse timestamps
+            def parse_ts(val):
+                if not val: return None
+                if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
+                    return int(val)
+                try:
+                    import datetime
+                    val_str = str(val).replace('Z', '+00:00')
+                    dt = datetime.datetime.fromisoformat(val_str)
+                    return int(dt.timestamp() * 1000)
+                except:
+                    return None
+
+            created_at = pair_info.get("createdAt") or pair_info.get("pairCreatedAt")
+            if not created_at and "pair" in pair_info: 
+                 created_at = pair_info["pair"].get("createdAt")
+            
+            open_trading = pair_info.get("openTrading") or pair_info.get("pair", {}).get("openTrading")
+            supply = float(pair_info.get("supply", 0))
+            
+            created_at_ms = parse_ts(created_at)
+            open_trading_ms = parse_ts(open_trading)
+            
+            # Determine start time: prefer open_trading, fallback to created_at
+            if open_trading_ms:
+                start_ts = open_trading_ms
+            elif created_at_ms:
+                start_ts = created_at_ms
+            else:
+                raise ValueError("Could not determine start time (no creation or openTrading time)")
+                
+        except Exception as e:
+             raise Exception(f"Error fetching pair info for analysis: {e}")
+
+        # 2. Get last transaction time (Required by API)
+        last_transaction_time = None
+        try:
+            last_tx = self.get_last_transaction(pair_address)
+            if last_tx and "createdAt" in last_tx:
+                import datetime
+                lt_str = last_tx["createdAt"].replace('Z', '+00:00')
+                dt = datetime.datetime.fromisoformat(lt_str)
+                last_transaction_time = int(dt.timestamp() * 1000)
+        except Exception as e:
+            self.logger.warning(f"Error fetching last transaction: {e}")
+
+        # We need very short duration for 1s check, but let's fetch a bit more to be safe
+        needed_duration_seconds = 10 
+        end_ts = start_ts + (needed_duration_seconds * 1000)
+        
+        try:
+            # Fetch 1s candles
+            candles = self.get_pair_chart(
+                pair_address=pair_address,
+                from_ts=start_ts,
+                to_ts=end_ts,
+                interval="1s", # Requesting 1s interval
+                count_bars=300, 
+                pair_created_at=created_at_ms,
+                open_trading=open_trading_ms,
+                last_transaction_time=last_transaction_time,
+                currency=currency
+            )
+        except Exception as e:
+            self.logger.error(f"Error fetching candles for {pair_address}: {e}")
+            candles = []
+
+        # 3. Calculate ATH for 1s interval
+        results = {}
+        
+        if not candles:
+             return {"1s": {"price": 0.0, "mcap": 0.0}}
+        
+        # Sort candles by time
+        candles.sort(key=lambda x: x.get("time", 0))
+        
+        # Helper to get max high from first N seconds (candles are 1s)
+        def get_max_high_seconds(n_seconds):
+            if not candles:
+                return 0.0
+            
+            # Filter candles that are within the first n_seconds from start_ts
+            # Note: get_pair_chart returns candles with 'time' (start of candle)
+            
+            cutoff = start_ts + (n_seconds * 1000)
+            subset = [c for c in candles if c.get("time", 0) < cutoff]
+            
+            if not subset:
+                 # If no candles strictly < cutoff (maybe first candle starts AT start_ts), take the first one if it's close?
+                 # Actually, usually candle at start_ts covers [start_ts, start_ts+1s).
+                 # So for 1s check, we want candles where time < start_ts + 1000.
+                 return 0.0
+                 
+            return max(float(c.get("high", 0)) for c in subset)
+
+        ath_price = get_max_high_seconds(1)
+        # Fallback: if 0, maybe take the first candle's high/close? 
+        # Sometimes 1st candle might be slightly delayed or aligned. 
+        # If strict 1s yields nothing, let's try to grab *at least* the first available candle if it's very close.
+        if ath_price == 0.0 and candles:
+            first_candle = candles[0]
+            if first_candle.get("time", 0) <= start_ts + 1000:
+                 ath_price = float(first_candle.get("high", 0))
+
+        results["1s"] = {
+            "price": ath_price,
+            "mcap": ath_price * supply
+        }
                 
         return results
     

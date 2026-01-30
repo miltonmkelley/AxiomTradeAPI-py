@@ -390,16 +390,40 @@ class AuthManager:
         self.session.mount("http://", adapter)
         self.logger.debug("Session initialized with connection pooling (size=50) and retries")
     
+    def _decode_jwt(self, token: str) -> dict:
+        """Decode JWT token without verification"""
+        try:
+            parts = token.split('.')
+            if len(parts) != 3:
+                return {}
+            payload = parts[1]
+            padding = len(payload) % 4
+            if padding:
+                payload += '=' * (4 - padding)
+            decoded = base64.urlsafe_b64decode(payload)
+            return json.loads(decoded)
+        except Exception:
+            return {}
+
     def _set_tokens(self, auth_token: str, refresh_token: str, 
                    expires_in: int = 3600, save_tokens: bool = True) -> None:
         """Set authentication tokens"""
         current_time = time.time()
         
+        # Try to get expiry from JWT
+        payload = self._decode_jwt(auth_token)
+        if 'exp' in payload:
+            expires_at = payload['exp']
+            issued_at = payload.get('iat', current_time)
+        else:
+            expires_at = current_time + expires_in
+            issued_at = current_time
+        
         self.tokens = AuthTokens(
             access_token=auth_token,
             refresh_token=refresh_token,
-            expires_at=current_time + expires_in,
-            issued_at=current_time
+            expires_at=expires_at,
+            issued_at=issued_at
         )
         
         # Update cookies
@@ -609,10 +633,10 @@ class AuthManager:
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 OPR/120.0.0.0'
         }
         
-        # Add cookies with both tokens (as shown in your curl)
+        # Add cookies - ONLY send refresh token to avoid invalid signature on expired access token
         cookies = {
             'auth-refresh-token': self.tokens.refresh_token,
-            'auth-access-token': self.tokens.access_token
+            # 'auth-access-token': self.tokens.access_token # Removed to avoid 500 error
         }
         
         try:
