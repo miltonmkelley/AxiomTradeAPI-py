@@ -316,7 +316,8 @@ class AuthManager:
     
     def __init__(self, username: str = None, password: str = None, 
                  auth_token: str = None, refresh_token: str = None,
-                 storage_dir: str = None, use_saved_tokens: bool = True):
+                 storage_dir: str = None, use_saved_tokens: bool = True,
+                 proxy: str = None):
         """
         Initialize AuthManager
         
@@ -327,11 +328,13 @@ class AuthManager:
             refresh_token: Existing refresh token (optional)
             storage_dir: Directory for secure token storage
             use_saved_tokens: Whether to load saved tokens (default: True)
+            proxy: Proxy URL (socks5://user:pass@host:port or http://host:port)
         """
         self.username = username
         self.password = password
         self.base_url = "https://axiom.trade"
         self.use_saved_tokens = use_saved_tokens
+        self.proxy = proxy
         
         # Setup logging
         self.logger = logging.getLogger(__name__)
@@ -367,14 +370,22 @@ class AuthManager:
         self._init_session()
 
     def _init_session(self):
-        """Initialize requests session with pooling and retries"""
+        """Initialize requests session with pooling, retries, and optional proxy"""
         self.session = requests.Session()
         
-        # Configure retry strategy
+        # Configure proxy if provided
+        if self.proxy:
+            self.session.proxies = {
+                'http': self.proxy,
+                'https': self.proxy
+            }
+            self.logger.info(f"Session configured with proxy: {self.proxy.split('@')[-1] if '@' in self.proxy else self.proxy}")
+        
+        # Configure retry strategy - minimal retries to fail fast
         retry_strategy = Retry(
-            total=5,  # Increased for stability
-            backoff_factor=1.0, # Exponential backoff: 1s, 2s, 4s, 8s, 16s
-            status_forcelist=[500, 502, 503, 504],
+            total=2,  # Reduced from 5 - fail fast, let pool handle rotation
+            backoff_factor=0.3, # Quick backoff: 0.3s, 0.6s
+            status_forcelist=[502, 503, 504],  # Removed 500 - handle in pool
             allowed_methods=["GET", "POST"]
         )
         
@@ -388,7 +399,11 @@ class AuthManager:
         
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        self.logger.debug("Session initialized with connection pooling (size=50) and retries")
+        
+        # Set default timeout for all requests (connect, read)
+        self.session.timeout = (5, 10)  # 5s connect, 10s read
+        
+        self.logger.debug("Session initialized with connection pooling (size=50), retries, and 10s timeout")
     
     def _decode_jwt(self, token: str) -> dict:
         """Decode JWT token without verification"""
@@ -644,7 +659,9 @@ class AuthManager:
             
             # Use the exact endpoint from your curl command
             refresh_url = 'https://api.axiom.trade/refresh-access-token'
-            response = requests.post(
+            
+            # Use self.session to include proxy settings!
+            response = self.session.post(
                 refresh_url,
                 headers=headers,
                 cookies=cookies,
@@ -740,13 +757,23 @@ class AuthManager:
         if not self.ensure_valid_authentication():
             self.logger.warning("No valid authentication available")
         
-        # Base headers
+        # Realistic browser headers to avoid bot detection
         headers = {
-            "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/discover",
-            "User-Agent": "AxiomTradeAPI-py/1.0"
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Content-Type": "application/json",
+            "Origin": "https://axiom.trade",
+            "Referer": "https://axiom.trade/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "sec-ch-ua": '"Chromium";v="135", "Not-A.Brand";v="8", "Google Chrome";v="135"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+            "Connection": "keep-alive",
+            "Priority": "u=1, i"
         }
         
         # Add authentication cookies if available
@@ -837,8 +864,13 @@ class AuthManager:
         headers = kwargs.pop('headers', {})
         authenticated_headers = self.get_authenticated_headers(headers)
         
-        # Make the request using the session
+        # Make the request using the session with timeout
         self.logger.debug(f"Making authenticated {method} request to {url}")
+        
+        # Set default timeout if not provided (15s to prevent hangs)
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = 15
+        
         response = self.session.request(method, url, headers=authenticated_headers, **kwargs)
         
         return response

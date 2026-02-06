@@ -38,7 +38,8 @@ class AxiomTradeClient:
     
     def __init__(self, username: str = None, password: str = None, 
                  auth_token: str = None, refresh_token: str = None,
-                 storage_dir: str = None, use_saved_tokens: bool = True):
+                 storage_dir: str = None, use_saved_tokens: bool = True,
+                 proxy: str = None):
         """
         Initialize AxiomTradeClient with enhanced authentication
         
@@ -49,6 +50,7 @@ class AxiomTradeClient:
             refresh_token: Existing refresh token (optional)
             storage_dir: Directory for secure token storage
             use_saved_tokens: Whether to load/save tokens automatically (default: True)
+            proxy: Proxy URL (socks5://user:pass@host:port or http://host:port)
         """
         # Initialize the enhanced auth manager
         self.auth_manager = AuthManager(
@@ -57,7 +59,8 @@ class AxiomTradeClient:
             auth_token=auth_token,
             refresh_token=refresh_token,
             storage_dir=storage_dir,
-            use_saved_tokens=use_saved_tokens
+            use_saved_tokens=use_saved_tokens,
+            proxy=proxy
         )
         
         # Initialize endpoints for trading functionality
@@ -547,7 +550,11 @@ class AxiomTradeClient:
         # Manually constructing the URL to ensure correct parameter encoding if needed, 
         # or just pass params to requests. 
         # API9 matches the user's example.
-        url = "https://api9.axiom.trade/pair-chart"
+        url = "https://api8.axiom.trade/pair-chart"
+        
+        # Build full URL for debugging
+        from urllib.parse import urlencode
+        full_url = f"{url}?{urlencode(params)}"
         
         try:
             response = self.auth_manager.make_authenticated_request('GET', url, params=params)
@@ -555,6 +562,8 @@ class AxiomTradeClient:
             data = response.json()
             
             if isinstance(data, list):
+                if not data:
+                    self.logger.warning(f"⚠️ Empty candles list. URL: {full_url}")
                 return data
             elif isinstance(data, dict):
                 # Try to find the list in common keys
@@ -563,13 +572,14 @@ class AxiomTradeClient:
                         return data[key]
                 
                 # If no list found, maybe the dict IS the candle (unlikely) or it's an error/empty
-                self.logger.warning(f"get_pair_chart returned a dict with keys: {list(data.keys())}, expected a list.")
+                self.logger.warning(f"get_pair_chart returned dict with keys: {list(data.keys())}. URL: {full_url}")
                 return []
             else:
-                self.logger.warning(f"get_pair_chart returned unexpected type: {type(data)}")
+                self.logger.warning(f"get_pair_chart returned unexpected type: {type(data)}. URL: {full_url}")
                 return []
                 
         except Exception as e:
+            self.logger.error(f"Failed to get pair chart. URL: {full_url}")
             raise Exception(f"Failed to get pair chart: {e}")
 
     def analyze_pair_ath_intervals(self, pair_address: str, currency: str = "SOL") -> Dict[str, Dict[str, float]]:
@@ -607,6 +617,31 @@ class AxiomTradeClient:
             open_trading = pair_info.get("openTrading") or pair_info.get("pair", {}).get("openTrading")
             supply = float(pair_info.get("supply", 0))
             
+            # Check if pair was migrated (e.g., from Pump to Raydium)
+            # If so, use the migrated pair address for candle fetching
+            chart_pair_address = pair_address
+            extra = pair_info.get("extra", {})
+            
+            # Check multiple possible locations for migrated address
+            migrated_to = None
+            if extra and extra.get("migratedTo"):
+                migrated_to = extra["migratedTo"]
+            elif pair_info.get("migratedTo"):
+                migrated_to = pair_info["migratedTo"]
+            elif pair_info.get("pair", {}).get("migratedTo"):
+                migrated_to = pair_info["pair"]["migratedTo"]
+            elif extra and extra.get("migratedPair"):
+                migrated_to = extra["migratedPair"]
+            elif pair_info.get("migratedPair"):
+                migrated_to = pair_info["migratedPair"]
+            
+            if migrated_to:
+                self.logger.info(f"Pair {pair_address} migrated to {migrated_to}, using migrated address for candles")
+                chart_pair_address = migrated_to
+            else:
+                # Debug: Log available keys to find migration info
+                self.logger.warning(f"🔍 No migration found for {pair_address}. Keys: {list(pair_info.keys())}, extra: {list(extra.keys()) if extra else 'None'}")
+            
             created_at_ms = parse_ts(created_at)
             open_trading_ms = parse_ts(open_trading)
             
@@ -621,6 +656,7 @@ class AxiomTradeClient:
         except Exception as e:
              raise Exception(f"Error fetching pair info for analysis: {e}")
 
+
         # Define intervals in milliseconds (for reference, logic uses raw minutes)
         intervals_map = {
             "1min": 1,
@@ -634,24 +670,16 @@ class AxiomTradeClient:
         # Updated to match DB schema: 1, 3, 5, 10, 30, 60, 240
         output_intervals = [1, 3, 5, 10, 30, 60, 240]
         
-        # 2. Get last transaction time (Required by API)
-        last_transaction_time = None
-        try:
-            last_tx = self.get_last_transaction(pair_address)
-            if last_tx and "createdAt" in last_tx:
-                import datetime
-                lt_str = last_tx["createdAt"].replace('Z', '+00:00')
-                dt = datetime.datetime.fromisoformat(lt_str)
-                last_transaction_time = int(dt.timestamp() * 1000)
-        except Exception as e:
-            self.logger.warning(f"Error fetching last transaction: {e}")
+        # 2. Use current time as lastTransactionTime (saves API call, works fine)
+        import time
+        last_transaction_time = int(time.time() * 1000)
 
         needed_duration_minutes = 245 # Small buffer over 240
         end_ts = start_ts + (needed_duration_minutes * 60 * 1000)
         
         try:
             candles = self.get_pair_chart(
-                pair_address=pair_address,
+                pair_address=chart_pair_address,
                 from_ts=start_ts,
                 to_ts=end_ts,
                 interval="1m",
@@ -662,17 +690,30 @@ class AxiomTradeClient:
                 currency=currency
             )
         except Exception as e:
-            self.logger.error(f"Error fetching candles for {pair_address}: {e}")
+            self.logger.error(f"Error fetching candles for {chart_pair_address}: {e}")
             candles = []
+
 
         # 3. Calculate ATH for each interval
         results = {}
         
         if not candles:
-             return {f"{k}min": {"price": 0.0, "mcap": 0.0} for k in output_intervals}
+            # DEBUG: Log why we have no candles
+            self.logger.warning(
+                f"⚠️ Empty candles for {pair_address}: "
+                f"chart_addr={chart_pair_address}, "
+                f"created_at={created_at_ms}, "
+                f"open_trading={open_trading_ms}, "
+                f"start_ts={start_ts}, "
+                f"end_ts={end_ts}, "
+                f"last_tx={last_transaction_time}"
+            )
+            return {f"{k}min": {"price": 0.0, "mcap": 0.0} for k in output_intervals}
         
-        # Sort candles by time
-        candles.sort(key=lambda x: x.get("time", 0))
+        # print(f"[DEBUG LIB] Candles count: {len(candles)}")
+        # if candles:
+        #     print(f"[DEBUG LIB] First candle: {candles[0]}")
+        # candles.sort(key=lambda x: x.get("time", 0))
         
         # Helper to get max high from first N candles
         def get_max_high(n_candles):
