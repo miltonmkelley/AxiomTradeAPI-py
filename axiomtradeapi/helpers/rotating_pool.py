@@ -24,6 +24,7 @@ class AccountConfig:
     last_request_time: float = 0.0
     error_count: int = 0
     banned_until: float = 0.0
+    is_permanently_banned: bool = False
 
 
 @dataclass
@@ -265,19 +266,35 @@ class RotatingClientPool:
             client, account = self.clients[self._current_index]
             
             # If current client is banned, try to find another
-            if account.banned_until > now:
-                for i, (c, acc) in enumerate(self.clients):
-                    if acc.banned_until <= now:
-                        self._current_index = i
-                        self._client_switch_time = now
-                        client, account = c, acc
-                        self.logger.info(f"🔄 Switched to non-banned client: {acc.name}")
-                        break
+            # If current client is banned, try to find another
+            if account.banned_until > now or account.is_permanently_banned:
+                available_indices = []
+                for i, (_, acc) in enumerate(self.clients):
+                    if not acc.is_permanently_banned and acc.banned_until <= now:
+                        available_indices.append(i)
+                
+                if available_indices:
+                    # Pick next available (round-robin style relative to current)
+                    # Find closest index > current_index, else min index
+                    next_indices = [i for i in available_indices if i > self._current_index]
+                    if next_indices:
+                        self._current_index = next_indices[0]
+                    else:
+                        self._current_index = available_indices[0]
+                        
+                    self._client_switch_time = now
+                    client, account = self.clients[self._current_index]
+                    self.logger.info(f"🔄 Switched to non-banned client: {account.name}")
                 else:
-                    # All banned - wait for first to unban
-                    min_ban_end = min(acc.banned_until for _, acc in self.clients)
+                    # Check if all are permanently banned
+                    not_permanently_banned = [acc for _, acc in self.clients if not acc.is_permanently_banned]
+                    if not not_permanently_banned:
+                         raise RuntimeError("All proxies/accounts are permanently banned from Axiom API")
+
+                    # All available are temporarily banned - wait for first to unban
+                    min_ban_end = min(acc.banned_until for acc in not_permanently_banned)
                     wait_time = max(0, min_ban_end - now)
-                    self.logger.warning(f"⚠️ All clients banned, waiting {wait_time:.0f}s")
+                    self.logger.warning(f"⚠️ All active clients temporarily banned, waiting {wait_time:.0f}s")
                     time.sleep(wait_time + 1)
                     return self.get_client()
             
@@ -310,22 +327,33 @@ class RotatingClientPool:
                 if c is client:
                     account.error_count += 1
                     
-                    if is_rate_limit or account.error_count >= self.config.max_errors_before_ban:
+                    if is_rate_limit:
+                        # Permanent ban for IP bans / 429s if configured or implied by severe error
+                        account.is_permanently_banned = True
+                        self.logger.error(f"⛔ {account.name} PERMANENTLY BANNED due to rate limit/IP ban")
+                    elif account.error_count >= self.config.max_errors_before_ban:
                         cooldown = self.config.ban_cooldown * (self.config.backoff_factor ** (account.error_count - 1))
                         cooldown = min(cooldown, 3600)  # Max 1 hour
                         account.banned_until = time.time() + cooldown
                         self.logger.warning(
-                            f"🚫 {account.name} banned for {cooldown:.0f}s "
+                            f"🚫 {account.name} temporarily banned for {cooldown:.0f}s "
                             f"(error_count={account.error_count})"
                         )
                     
                     # Auto-switch to next proxy on error
                     if self.config.auto_switch_on_error and len(self.clients) > 1:
-                        old_index = self._current_index
-                        self._current_index = (i + 1) % len(self.clients)
-                        self._client_switch_time = time.time()
-                        _, new_acc = self.clients[self._current_index]
-                        self.logger.info(f"⚡ Auto-switched proxy: {account.name} → {new_acc.name} (error triggered)")
+                        # Find next non-permanently banned client
+                        start_index = (i + 1) % len(self.clients)
+                        for offset in range(len(self.clients)):
+                            idx = (start_index + offset) % len(self.clients)
+                            _, next_acc = self.clients[idx]
+                            if not next_acc.is_permanently_banned:
+                                self._current_index = idx
+                                self._client_switch_time = time.time()
+                                self.logger.info(f"⚡ Auto-switched proxy: {account.name} → {next_acc.name} (error triggered)")
+                                break
+                        else:
+                             self.logger.critical("❌ All clients are permanently banned!")
                     break
     
     def force_switch(self) -> None:
@@ -350,7 +378,8 @@ class RotatingClientPool:
                     "name": acc.name,
                     "error_count": acc.error_count,
                     "banned": acc.banned_until > now,
-                    "banned_remaining": max(0, int(acc.banned_until - now))
+                    "banned_remaining": max(0, int(acc.banned_until - now)),
+                    "is_permanently_banned": acc.is_permanently_banned
                 }
                 for _, acc in self.clients
             ]
