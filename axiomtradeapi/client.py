@@ -490,7 +490,9 @@ class AxiomTradeClient:
         if not self.ensure_authenticated():
             raise ValueError("Authentication failed. Please login first.")
         
-        url = f'https://api10.axiom.trade/transactions-feed?pairAddress={pair_address}&orderBy={order_by}&makerAddress={maker_address}'
+        import time
+        current_ts = int(time.time() * 1000)
+        url = f'https://api.axiom.trade/transactions-feed-v2?pairAddress={pair_address}&orderBy={order_by}&makerAddress={maker_address}&v={current_ts}'
         
         try:
             response = self.auth_manager.make_authenticated_request('GET', url)
