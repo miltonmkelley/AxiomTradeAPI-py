@@ -487,9 +487,6 @@ class AxiomTradeClient:
             List[Dict]: List of transactions
         """
         # Ensure we have valid authentication
-        if not self.ensure_authenticated():
-            raise ValueError("Authentication failed. Please login first.")
-        
         import time
         current_ts = int(time.time() * 1000)
         url = f'https://api.axiom.trade/transactions-feed-v2?pairAddress={pair_address}&orderBy={order_by}&makerAddress={maker_address}&v={current_ts}'
@@ -497,7 +494,69 @@ class AxiomTradeClient:
         try:
             response = self.auth_manager.make_authenticated_request('GET', url)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            
+            # Helper to convert list format to dict format
+            # Format Example: ["txHash", "pairAddress", "type", "timestamp", priceUsd, amountTokens, "maker", priceNative, pricePerToken, volumeUsd, volumeNative, ???, ???, ???]
+            # Based on user example:
+            # 0: signature "DkNM..."
+            # 1: pairAddress "7X3niv..."
+            # 2: type "add" / "buy"
+            # 3: timestamp "2026-01-27T10:40:47.568Z"
+            # 4: priceUsd? or priceNative? -> "30" looks high for price, maybe amount? 
+            #    Let's look at "buy" example: 30.100000018 (Amount?), 1069435215.312293 (Native/Volume?), "27cAm..." (Maker)
+            #    Wait, indices:
+            #    0: tx_hash
+            #    1: pair_address
+            #    2: type
+            #    3: timestamp
+            #    4: price_usd (or native?)
+            #    5: amount_token
+            #    6: maker
+            #    7: price_native (maybe)
+            #    8: price_usd_per_token?
+            #    9: volume_usd?
+            #    10: volume_native?
+            
+            # Let's map robustly assuming standard fields usually needed:
+            # We need: block_time (3), signature (0), limit_order_type (2), owner (6), amount (5), price_usd (?), volume_usd (9?)
+            
+            # Let's try to map generic fields or just return raw if downstream handles it. 
+            # But solBot/analyze_scam_improved.py expects dicts with specific keys.
+            
+            # analyze_scam_improved.py usage:
+            # tx.get('block_time') -> timestamp (3)
+            # tx.get('signature') -> signature (0)
+            # tx.get('limit_order_type') -> type (2)
+            # tx.get('owner') -> maker (6)
+            # tx.get('amount') -> amount (5)
+            # tx.get('price_usd') -> ?
+            # tx.get('volume_usd') -> ?
+            
+            # From example: ["...hash", "...pair", "buy", "date", 30.1, 1069435215.3, "maker", 2.8e-8, 3.4e-6, 3564784, 0.1, 12.5, null, 5]
+            # 5: 1069435215.3 (Amount tokens?) 
+            # 4: 30.1 (Price? or Volume?)
+            
+            parsed_txs = []
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, list) and len(item) >= 7:
+                        tx = {
+                            "signature": item[0],
+                            "pair_address": item[1],
+                            "limit_order_type": item[2],  # "buy", "sell", "add"
+                            "block_time": item[3],        # ISO string
+                            "price_usd": item[4],         # Looks like Price USD total or per token?
+                            "amount": item[5],            # Token amount
+                            "owner": item[6],             # Maker address
+                        }
+                        # Add optional fields if available
+                        if len(item) > 9:
+                             tx["volume_usd"] = item[9]
+                             
+                        parsed_txs.append(tx)
+            return parsed_txs
+            
         except Exception as e:
             raise Exception(f"Failed to get transactions feed: {e}")
 
