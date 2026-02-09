@@ -528,6 +528,9 @@ class AxiomTradeClient:
             raise ValueError("Authentication failed. Please login first.")
 
         # Construct query parameters
+        import time
+        current_ts = int(time.time() * 1000)
+        
         params = {
             "pairAddress": pair_address,
             "from": from_ts,
@@ -537,7 +540,7 @@ class AxiomTradeClient:
             "countBars": count_bars,
             "showOutliers": "false",
             "isNew": "false",
-            "v": "2"
+            "v": current_ts  # Use current timestamp instead of static "2"
         }
         
         if pair_created_at:
@@ -549,8 +552,8 @@ class AxiomTradeClient:
             
         # Manually constructing the URL to ensure correct parameter encoding if needed, 
         # or just pass params to requests. 
-        # API9 matches the user's example.
-        url = "https://api8.axiom.trade/pair-chart"
+        # Use pair-chart-v2 endpoint
+        url = "https://api8.axiom.trade/pair-chart-v2"
         
         # Build full URL for debugging
         from urllib.parse import urlencode
@@ -561,15 +564,41 @@ class AxiomTradeClient:
             response.raise_for_status()
             data = response.json()
             
+            # Helper to convert array format to dict format
+            def convert_candle(c):
+                if isinstance(c, dict):
+                    return c
+                elif isinstance(c, list) and len(c) >= 6:
+                    # v2 format: [time, open, high, low, close, volume]
+                    return {
+                        "time": c[0],
+                        "open": c[1],
+                        "high": c[2],
+                        "low": c[3],
+                        "close": c[4],
+                        "volume": c[5] if len(c) > 5 else 0
+                    }
+                return None
+            
+            candles = []
             if isinstance(data, list):
-                if not data:
-                    self.logger.warning(f"⚠️ Empty candles list. URL: {full_url}")
-                return data
+                for item in data:
+                    converted = convert_candle(item)
+                    if converted:
+                        candles.append(converted)
+                if not candles and data:
+                    self.logger.warning(f"⚠️ Could not parse candles. First item: {data[0] if data else 'empty'}. URL: {full_url}")
+                return candles
             elif isinstance(data, dict):
                 # Try to find the list in common keys
                 for key in ["data", "candles", "bars", "result", "items"]:
                     if key in data and isinstance(data[key], list):
-                        return data[key]
+                        raw_list = data[key]
+                        for item in raw_list:
+                            converted = convert_candle(item)
+                            if converted:
+                                candles.append(converted)
+                        return candles
                 
                 # If no list found, maybe the dict IS the candle (unlikely) or it's an error/empty
                 self.logger.warning(f"get_pair_chart returned dict with keys: {list(data.keys())}. URL: {full_url}")
