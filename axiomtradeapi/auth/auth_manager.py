@@ -214,7 +214,8 @@ class AuthManager:
     
     def __init__(self, username: str = None, password: str = None, 
                  auth_token: str = None, refresh_token: str = None,
-                 storage_dir: str = None, use_saved_tokens: bool = True):
+                 storage_dir: str = None, use_saved_tokens: bool = True,
+                 proxy: str = None):
         """
         Initialize AuthManager
         
@@ -225,11 +226,14 @@ class AuthManager:
             refresh_token: Existing refresh token (optional)
             storage_dir: Directory for secure token storage
             use_saved_tokens: Whether to load saved tokens (default: True)
+            proxy: Proxy URL to use for requests (optional)
         """
         self.username = username
         self.password = password
         self.base_url = "https://axiom.trade"
         self.use_saved_tokens = use_saved_tokens
+        self.proxy = proxy
+
         
         # Setup logging
         self.logger = logging.getLogger(__name__)
@@ -685,10 +689,17 @@ class AuthManager:
         authenticated_headers = self.get_authenticated_headers(headers)
         
         # Make the request
+        # Make the request
         self.logger.debug(f"Making authenticated {method} request to {url}")
-        response = requests.request(method, url, headers=authenticated_headers, **kwargs)
+        
+        proxies = None
+        if self.proxy:
+            proxies = {"http": self.proxy, "https": self.proxy}
+            
+        response = requests.request(method, url, headers=authenticated_headers, proxies=proxies, **kwargs)
         
         return response
+
 
 
 # Convenience function for quick authentication

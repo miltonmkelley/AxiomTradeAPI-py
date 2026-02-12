@@ -37,7 +37,7 @@ class AxiomTradeClient:
     
     def __init__(self, username: str = None, password: str = None, 
                  auth_token: str = None, refresh_token: str = None,
-                 storage_dir: str = None, use_saved_tokens: bool = True):
+                 storage_dir: str = None, use_saved_tokens: bool = True, **kwargs):
         """
         Initialize AxiomTradeClient with enhanced authentication
         
@@ -56,7 +56,8 @@ class AxiomTradeClient:
             auth_token=auth_token,
             refresh_token=refresh_token,
             storage_dir=storage_dir,
-            use_saved_tokens=use_saved_tokens
+            use_saved_tokens=use_saved_tokens,
+            proxy=kwargs.get('proxy')
         )
         
         # Initialize endpoints for trading functionality
