@@ -58,17 +58,18 @@ class AuthTokens:
 class SecureTokenStorage:
     """Handles secure storage and retrieval of authentication tokens"""
     
-    def __init__(self, storage_dir: str = None):
+    def __init__(self, storage_dir: str = None, token_filename: str = "tokens.enc"):
         """
         Initialize secure token storage
         
         Args:
             storage_dir: Directory to store tokens (default: ~/.axiomtradeapi)
+            token_filename: Name of the token file (default: tokens.enc)
         """
         self.storage_dir = Path(storage_dir or Path.home() / '.axiomtradeapi')
         self.storage_dir.mkdir(exist_ok=True, mode=0o700)  # Only user can access
         
-        self.token_file = self.storage_dir / 'tokens.enc'
+        self.token_file = self.storage_dir / token_filename
         self.key_file = self.storage_dir / 'key.enc'
         
         self.logger = logging.getLogger(__name__)
@@ -215,7 +216,7 @@ class AuthManager:
     def __init__(self, username: str = None, password: str = None, 
                  auth_token: str = None, refresh_token: str = None,
                  storage_dir: str = None, use_saved_tokens: bool = True,
-                 proxy: str = None):
+                 proxy: str = None, token_filename: str = "tokens.enc"):
         """
         Initialize AuthManager
         
@@ -227,6 +228,7 @@ class AuthManager:
             storage_dir: Directory for secure token storage
             use_saved_tokens: Whether to load saved tokens (default: True)
             proxy: Proxy URL to use for requests (optional)
+            token_filename: Name of the token file (default: tokens.enc)
         """
         self.username = username
         self.password = password
@@ -242,7 +244,7 @@ class AuthManager:
         self.cookie_manager = CookieManager()
         
         # Initialize secure token storage
-        self.token_storage = SecureTokenStorage(storage_dir)
+        self.token_storage = SecureTokenStorage(storage_dir, token_filename=token_filename)
         
         # Token storage
         self.tokens: Optional[AuthTokens] = None
@@ -705,7 +707,8 @@ class AuthManager:
 # Convenience function for quick authentication
 def create_authenticated_session(username: str = None, password: str = None,
                                 auth_token: str = None, refresh_token: str = None,
-                                storage_dir: str = None, use_saved_tokens: bool = True) -> AuthManager:
+                                storage_dir: str = None, use_saved_tokens: bool = True,
+                                token_filename: str = "tokens.enc") -> AuthManager:
     """
     Create an authenticated session
     
@@ -716,6 +719,7 @@ def create_authenticated_session(username: str = None, password: str = None,
         refresh_token: Existing refresh token (optional)
         storage_dir: Directory for secure token storage
         use_saved_tokens: Whether to load/save tokens (default: True)
+        token_filename: Name of the token file (default: tokens.enc)
         
     Returns:
         AuthManager: Configured authentication manager
@@ -726,5 +730,6 @@ def create_authenticated_session(username: str = None, password: str = None,
         auth_token=auth_token,
         refresh_token=refresh_token,
         storage_dir=storage_dir,
-        use_saved_tokens=use_saved_tokens
+        use_saved_tokens=use_saved_tokens,
+        token_filename=token_filename
     )
