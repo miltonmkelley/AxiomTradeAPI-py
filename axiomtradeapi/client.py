@@ -296,6 +296,54 @@ class AxiomTradeClient:
             return response.json()
         except Exception as e:
             raise Exception(f"Failed to get last transaction: {e}")
+
+    def get_transactions_feed(self, pair_address: str, order_by: str = 'ASC', maker_address: str = '') -> List[Dict]:
+        """
+        Get transactions feed for a pair
+        
+        Args:
+            pair_address (str): The pair address
+            order_by (str): Order by 'ASC' or 'DESC' (default: 'ASC')
+            maker_address (str): Filter by maker address (optional)
+            
+        Returns:
+            List[Dict]: List of transactions
+        """
+        if not self.ensure_authenticated():
+            raise ValueError("Authentication failed. Please login first.")
+        
+        url = f'https://api10.axiom.trade/transactions-feed?pairAddress={pair_address}&orderBy={order_by}&makerAddress={maker_address}'
+        
+        try:
+            response = self.auth_manager.make_authenticated_request('GET', url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self.logger.error(f"Failed to get transactions feed: {e}")
+            return []
+
+    def get_community_info_by_id(self, community_id: str) -> Dict:
+        """
+        Get community info by ID
+        
+        Args:
+            community_id (str): The community ID
+            
+        Returns:
+            Dict: Community information
+        """
+        if not self.ensure_authenticated():
+            raise ValueError("Authentication failed. Please login first.")
+            
+        url = f'https://api.axiom.trade/twitter-community-info?communityId={community_id}'
+        
+        try:
+            response = self.auth_manager.make_authenticated_request('GET', url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self.logger.error(f"Failed to get community info: {e}")
+            return {}
     
     def get_pair_info(self, pair_address: str) -> Dict:
         """
