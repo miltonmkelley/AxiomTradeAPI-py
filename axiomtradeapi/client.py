@@ -3,8 +3,14 @@ import requests
 import json
 import base64
 import logging
+import os
+import time
 from typing import Dict, Optional, List, Union, TYPE_CHECKING
-from .auth.auth_manager import AuthManager, create_authenticated_session
+from .auth.auth_manager import (
+    AuthManager, create_authenticated_session,
+    AuthTokens, PerAccountTokenStorage, BROWSER_HEADERS,
+    decode_jwt_payload,
+)
 from .content.endpoints import Endpoints
 
 # Trading-related imports
@@ -49,6 +55,8 @@ class AxiomTradeClient:
             refresh_token: Existing refresh token (optional)
             storage_dir: Directory for secure token storage
             use_saved_tokens: Whether to load/save tokens automatically (default: True)
+            proxy: Single proxy URL (optional, legacy)
+            proxy_list: List of proxy dicts for rotation (optional)
         """
         # Initialize the enhanced auth manager
         self.auth_manager = AuthManager(
@@ -59,6 +67,7 @@ class AxiomTradeClient:
             storage_dir=storage_dir,
             use_saved_tokens=use_saved_tokens,
             proxy=kwargs.get('proxy'),
+            proxy_list=kwargs.get('proxy_list'),
             token_filename=token_filename
         )
         
@@ -297,9 +306,86 @@ class AxiomTradeClient:
         except Exception as e:
             raise Exception(f"Failed to get last transaction: {e}")
 
-    def get_transactions_feed(self, pair_address: str, order_by: str = 'ASC', maker_address: str = '') -> List[Dict]:
+    def get_pair_info(self, pair_address: str) -> Dict:
         """
-        Get transactions feed for a pair
+        Get pair info from Axiom API.
+        
+        Args:
+            pair_address (str): The pair address
+            
+        Returns:
+            Dict: Pair information (createdAt, openTrading, supply, migratedTo, etc.)
+        """
+        if not self.ensure_authenticated():
+            raise ValueError("Authentication failed. Please login first.")
+        
+        url = f'https://api10.axiom.trade/pair-info?pairAddress={pair_address}&v={int(time.time() * 1000)}'
+        
+        try:
+            response = self.auth_manager.make_authenticated_request('GET', url)
+            if response.status_code == 200:
+                return response.json()
+            self.logger.warning(f"pair-info returned {response.status_code} for {pair_address[:16]}")
+            return {}
+        except Exception as e:
+            self.logger.error(f"Failed to get pair info: {e}")
+            return {}
+
+    def get_pair_chart(self, pair_address: str, from_ts: int, to_ts: int,
+                       currency: str = 'SOL', interval: str = '1m',
+                       count_bars: int = 300, pair_created_at: int = None,
+                       open_trading: int = None, **extra_params) -> List:
+        """
+        Get OHLCV chart data for a pair.
+        
+        Args:
+            pair_address: The pair address (may be migrated pair)
+            from_ts: Start timestamp in ms
+            to_ts: End timestamp in ms
+            currency: Price currency ('SOL' or 'USD')
+            interval: Candle interval ('1m', '5m', '15m', '1h', etc.)
+            count_bars: Max number of candles
+            pair_created_at: Pair creation time in ms (optional)
+            open_trading: Open trading time in ms (optional)
+            **extra_params: Additional query params
+            
+        Returns:
+            list: Raw candle data (list of arrays or dicts)
+        """
+        if not self.ensure_authenticated():
+            raise ValueError("Authentication failed. Please login first.")
+        
+        params = {
+            "pairAddress": pair_address,
+            "from": from_ts,
+            "to": to_ts,
+            "currency": currency,
+            "interval": interval,
+            "countBars": count_bars,
+            "showOutliers": "false",
+            "isNew": "false",
+            "v": int(time.time() * 1000),
+        }
+        if pair_created_at is not None:
+            params["pairCreatedAt"] = pair_created_at
+        if open_trading is not None:
+            params["openTrading"] = open_trading
+        params.update(extra_params)
+        
+        url = "https://api9.axiom.trade/pair-chart-v2"
+        try:
+            response = self.auth_manager.make_authenticated_request('GET', url, params=params)
+            if response.status_code == 200:
+                return response.json()
+            self.logger.warning(f"pair-chart-v2 returned {response.status_code}")
+            return []
+        except Exception as e:
+            self.logger.error(f"Failed to get pair chart: {e}")
+            return []
+
+    def get_transactions_feed(self, pair_address: str, order_by: str = 'ASC', maker_address: str = '') -> List:
+        """
+        Get transactions feed for a pair (v3 POST endpoint).
         
         Args:
             pair_address (str): The pair address
@@ -307,24 +393,56 @@ class AxiomTradeClient:
             maker_address (str): Filter by maker address (optional)
             
         Returns:
-            List[Dict]: List of transactions
+            list: List of transactions (raw arrays from v3 API)
+        """
+        return self.get_transactions_feed_v3(
+            pair_address=pair_address,
+            order_by=order_by,
+            maker_address=maker_address,
+        )
+
+    def get_transactions_feed_v3(self, pair_address: str, order_by: str = 'ASC',
+                                  maker_address: str = '', start_time: int = None,
+                                  end_time: int = None) -> List:
+        """
+        Get transactions feed via v3 POST endpoint.
+        
+        Args:
+            pair_address: The pair address
+            order_by: 'ASC' or 'DESC'
+            maker_address: Filter by maker (optional)
+            start_time: Start time in ms (optional, for pagination)
+            end_time: End time in ms (optional, for pagination)
+            
+        Returns:
+            list: List of transactions (raw arrays from v3 API)
         """
         if not self.ensure_authenticated():
             raise ValueError("Authentication failed. Please login first.")
         
-        url = f'https://api10.axiom.trade/transactions-feed?pairAddress={pair_address}&orderBy={order_by}&makerAddress={maker_address}'
+        url = 'https://api10.axiom.trade/transactions-feed-v3'
+        payload = {
+            "pairAddress": pair_address,
+            "orderBy": order_by,
+            "makerAddress": maker_address,
+            "v": int(time.time() * 1000),
+        }
+        if start_time is not None:
+            payload["startTime"] = start_time
+        if end_time is not None:
+            payload["endTime"] = end_time
         
         try:
-            response = self.auth_manager.make_authenticated_request('GET', url)
+            response = self.auth_manager.make_authenticated_request('POST', url, json=payload)
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            self.logger.error(f"Failed to get transactions feed: {e}")
+            self.logger.error(f"Failed to get transactions feed v3: {e}")
             return []
 
     def get_community_info_by_id(self, community_id: str) -> Dict:
         """
-        Get community info by ID
+        Get community info by ID (v2 endpoint).
         
         Args:
             community_id (str): The community ID
@@ -335,7 +453,7 @@ class AxiomTradeClient:
         if not self.ensure_authenticated():
             raise ValueError("Authentication failed. Please login first.")
             
-        url = f'https://api.axiom.trade/twitter-community-info?communityId={community_id}'
+        url = f'https://api.axiom.trade/wo/twitter-community-info-v2?communityId={community_id}'
         
         try:
             response = self.auth_manager.make_authenticated_request('GET', url)
@@ -1068,3 +1186,52 @@ def get_trending_with_token(access_token: str, time_period: str = '1h') -> Dict:
     client = AxiomTradeClient()
     client.set_tokens(access_token=access_token)
     return client.get_trending_tokens(time_period)
+
+
+def create_client_from_env(env_prefix: str = "",
+                           storage_path: str = None,
+                           proxy_list: List[dict] = None) -> AxiomTradeClient:
+    """
+    Create an AxiomTradeClient from environment variables.
+    
+    Reads {PREFIX}AUTH_TOKEN and {PREFIX}REFRESH_TOKEN from os.environ.
+    Uses PerAccountTokenStorage if storage_path is given.
+    
+    Args:
+        env_prefix: Prefix for env vars (e.g. "MIGRATIONS_" → MIGRATIONS_AUTH_TOKEN)
+        storage_path: Path for PerAccountTokenStorage file (e.g. "my_auth.enc")
+        proxy_list: List of proxy dicts for rotation
+        
+    Returns:
+        Configured AxiomTradeClient
+    """
+    auth_token = os.getenv(f"{env_prefix}AUTH_TOKEN")
+    refresh_token = os.getenv(f"{env_prefix}REFRESH_TOKEN")
+    
+    if not auth_token or not refresh_token:
+        raise ValueError(f"Environment variables {env_prefix}AUTH_TOKEN and "
+                         f"{env_prefix}REFRESH_TOKEN must be set")
+    
+    client = AxiomTradeClient(
+        auth_token=auth_token,
+        refresh_token=refresh_token,
+        proxy_list=proxy_list,
+    )
+    
+    if storage_path:
+        storage = PerAccountTokenStorage(storage_path)
+        client.auth_manager.token_storage = storage
+        client.auth_manager.use_saved_tokens = True
+        
+        # Try to load previously saved tokens
+        saved = storage.load_tokens()
+        if saved and not saved.is_expired:
+            client.auth_manager.tokens = saved
+            client.auth_manager.cookie_manager.set_auth_cookies(
+                saved.access_token, saved.refresh_token
+            )
+        else:
+            # Set from env with correct JWT expiry
+            client.auth_manager.set_tokens_from_jwt(auth_token, refresh_token)
+    
+    return client
